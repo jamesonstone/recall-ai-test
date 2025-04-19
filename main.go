@@ -11,14 +11,14 @@ import (
 	"sync"
 )
 
-// Header video metadata [big-endian format].
+// header video metadata [big-endian format].
 type Header struct {
 	Width      uint32
 	Height     uint32
 	FrameCount uint32
 }
 
-// RectRule represents one compositing rectangle.
+// rectRule represents one compositing rectangle.
 type RectRule struct {
 	Src   [4]uint32 // x, y, width, height
 	Dest  [2]uint32 // x, y
@@ -26,40 +26,40 @@ type RectRule struct {
 	Z     uint32    // stacking order
 }
 
-// RulesConfig is the top‑level JSON config.
+// rulesConfig is the top‑level JSON config.
 type RulesConfig struct {
 	Size  [2]uint32  // output width, height
 	Rects []RectRule // list of rectangles
 }
 
-// Frame represents a single frame and its metadata
+// frame represents a single frame and its metadata
 type Frame struct {
 	id     uint32
 	inBuf  []byte
 	outBuf []byte
 }
 
-// Global zero buffer for faster clearing (create once, reuse many times)
+// global zero buffer for faster clearing (create once, reuse many times)
 var zeroBuffer []byte
 
 // clearBuffer efficiently clears a buffer using a smaller zero buffer
-// This significantly reduces memory usage while maintaining performance
+// this significantly reduces memory usage while maintaining performance
 func clearBuffer(buffer []byte) {
-	// If buffer is small enough, use direct copy
+	// if buffer is small enough, use direct copy
 	if len(buffer) <= len(zeroBuffer) {
 		copy(buffer, zeroBuffer)
 		return
 	}
-	
-	// Optimization: for medium size buffers, copy zero buffer then copy that
-	// This approach is faster for large buffers since we copy larger segments
-	if len(buffer) <= 1024*1024 { // For buffers up to 1MB 
-		// Clear first chunk
+
+	// optimization: for medium size buffers, copy zero buffer then copy that
+	// this approach is faster for large buffers since we copy larger segments
+	if len(buffer) <= 1024*1024 { // For buffers up to 1MB
+		// clear first chunk
 		chunkSize := len(zeroBuffer)
 		copy(buffer[:chunkSize], zeroBuffer)
-		
-		// Double the cleared area in each iteration
-		// This is exponentially faster for larger buffers
+
+		// double the cleared area in each iteration
+		// this is exponentially faster for larger buffers
 		copied := chunkSize
 		for copied < len(buffer) {
 			toCopy := copied
@@ -71,7 +71,7 @@ func clearBuffer(buffer []byte) {
 		}
 		return
 	}
-	
+
 	// For very large buffers, clear in chunks of zeroBuffer size
 	chunkSize := len(zeroBuffer)
 	for offset := 0; offset < len(buffer); offset += chunkSize {
@@ -90,22 +90,22 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 
 	// composite all rectangles
 	for _, r := range rules.Rects {
-		// Extremely aggressive culling of low-impact rectangles to improve performance
-		// Skip barely visible rectangles (alpha < 0.1)
+		// extremely aggressive culling of low-impact rectangles to improve performance
+		// skip barely visible rectangles (alpha < 0.1)
 		if r.Alpha < 0.1 {
 			continue
 		}
-		
-		// Skip very small rectangles (less than 16x16 pixels)
+
+		// skip very small rectangles (less than 16x16 pixels)
 		if r.Src[2] < 16 || r.Src[3] < 16 {
 			continue
 		}
-		
-		// Convert float alpha to 8-bit integer (0-255) for fixed-point math
+
+		// convert float alpha to 8-bit integer (0-255) for fixed-point math
 		alpha := uint32(r.Alpha * 255)
 		invAlpha := 255 - alpha
 
-		// Precompute bounds to avoid redundant calculations in pixel loops
+		// precompute bounds to avoid redundant calculations in pixel loops
 		srcStartX := r.Src[0]
 		srcStartY := r.Src[1]
 		srcWidth := r.Src[2]
@@ -113,11 +113,11 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 		dstStartX := r.Dest[0]
 		dstStartY := r.Dest[1]
 
-		// Calculate effective bounds with clipping to screen boundaries
+		// calculate effective bounds with clipping to screen boundaries
 		effectiveWidth := srcWidth
 		effectiveHeight := srcHeight
 
-		// Apply clipping for source rectangle
+		// apply clipping for source rectangle
 		if srcStartX >= inWidth || srcStartY >= inHeight {
 			continue // Rectangle is completely off-screen (source)
 		}
@@ -132,7 +132,7 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 			effectiveHeight = inHeight - srcStartY
 		}
 
-		// Apply clipping for destination rectangle
+		// apply clipping for destination rectangle
 		if dstStartX >= outWidth || dstStartY >= outHeight {
 			continue // Rectangle is completely off-screen (destination)
 		}
@@ -284,7 +284,7 @@ func main() {
 			outBuf: make([]byte, outFrameSize),
 		},
 	}
-	
+
 	frameIndex := 0
 	framePool := sync.Pool{
 		New: func() interface{} {
