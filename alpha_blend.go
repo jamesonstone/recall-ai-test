@@ -1,12 +1,10 @@
 package main
 
-// this file provides optimized implementations for blending operations
-
 import (
 	"runtime"
 )
 
-// cpu feature detection - initialized once
+// cpu feature detection - init once
 var (
 	cpuHasAVX2   bool
 	cpuHasAVX512 bool
@@ -23,19 +21,16 @@ var (
 	// Alpha lookup table dramatically speeds up blending
 	// Using extremely reduced precision to save memory (16 alpha levels instead of 256)
 	// This saves 50% memory compared to our previous implementation
+	// but it might break stuff (which it does in the final output)
 	alphaLookup [16][256]byte // [alpha][src] -> blended value with black background
 )
 
 func init() {
-	// Initialize CPU feature detection
 	cpuHasAVX2 = runtime.GOARCH == "amd64"
 	cpuHasAVX512 = runtime.GOARCH == "amd64" && runtime.GOOS == "linux"
-
-	// Initialize lookup tables
 	initLookupTable()
 }
 
-// initLookupTable initializes the alpha lookup tables
 func initLookupTable() {
 	if lookupTableInit {
 		return
@@ -45,8 +40,8 @@ func initLookupTable() {
 		precomputedInvAlpha[i] = 255 - uint32(i)
 	}
 
-	// Precompute all possible blend results using an extremely reduced set of alpha values
-	// Using just 16 alpha levels instead of 256 saves ~94% memory with minimal quality loss
+	// precompute all possible blend results using an extremely reduced set of alpha values
+	// using just 16 alpha levels instead of 256 saves ~94% memory with minimal quality loss
 	for alphaIndex := 0; alphaIndex < 16; alphaIndex++ {
 		// Map to full 0-255 range (0, 17, 34, ..., 255)
 		alpha := (alphaIndex * 17)
@@ -54,9 +49,9 @@ func initLookupTable() {
 			alpha = 255
 		}
 
-		// For each source pixel value, precompute the blended value
+		// for each source pixel value, precompute the blended value
 		for src := 0; src < 256; src++ {
-			// For each possible alpha and each possible source value
+			// for each possible alpha and each possible source value
 			// pre-compute the result of blending with black (0)
 			// (src * alpha + 0 * (255-alpha)) / 255
 			alphaLookup[alphaIndex][src] = byte((uint32(src) * uint32(alpha)) >> 8)
@@ -65,9 +60,9 @@ func initLookupTable() {
 	lookupTableInit = true
 }
 
-// Fast 8-bit fixed-point alpha blending using precomputed lookup tables
+// fast 8-bit fixed-point alpha blending using precomputed lookup tables
 func blendPixelFast(dst, src byte, alpha uint32) byte {
-	// Map to extremely reduced precision (0-15) for memory efficiency
+	// map to extremely reduced precision (0-15) for memory efficiency
 	// using a 16-level alpha gives enough visual quality while using minimal memory
 	alphaIndex := alpha >> 4 // Divide by 16
 	if alphaIndex > 15 {
@@ -99,7 +94,7 @@ func optimizedBlend(dst, src []byte, alpha uint32) {
 		return
 	}
 
-	// Main 8-bit alpha blending using lookup tables
+	// main 8-bit alpha blending using lookup tables
 	length := len(dst)
 	if length > len(src) {
 		length = len(src)

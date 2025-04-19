@@ -32,7 +32,7 @@ type RulesConfig struct {
 	Rects []RectRule // list of rectangles
 }
 
-// frame represents a single frame and its metadata
+// frame represents a single frame+metadata
 type Frame struct {
 	id     uint32
 	inBuf  []byte
@@ -42,10 +42,9 @@ type Frame struct {
 // global zero buffer for faster clearing (create once, reuse many times)
 var zeroBuffer []byte
 
-// clearBuffer efficiently clears a buffer using a smaller zero buffer
+// clearBuffer efficiently clears a buffer using smaller zero buffer
 // this significantly reduces memory usage while maintaining performance
 func clearBuffer(buffer []byte) {
-	// if buffer is small enough, use direct copy
 	if len(buffer) <= len(zeroBuffer) {
 		copy(buffer, zeroBuffer)
 		return
@@ -85,13 +84,13 @@ func clearBuffer(buffer []byte) {
 
 // processFrame composites a single frame according to the rules
 func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth, outHeight uint32) {
-	// Clear output buffer using memory-efficient clearing
+	// clear output buffer using memory-efficient clearing
 	clearBuffer(frame.outBuf)
 
 	// composite all rectangles
 	for _, r := range rules.Rects {
 		// extremely aggressive culling of low-impact rectangles to improve performance
-		// skip barely visible rectangles (alpha < 0.1)
+		// skip barely visible rectangles (alpha < 0.1) to reduce processing time
 		if r.Alpha < 0.1 {
 			continue
 		}
@@ -122,12 +121,12 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 			continue // Rectangle is completely off-screen (source)
 		}
 
-		// Clip width if source extends beyond right edge
+		// clip width if source extends beyond right edge
 		if srcStartX+srcWidth > inWidth {
 			effectiveWidth = inWidth - srcStartX
 		}
 
-		// Clip height if source extends beyond bottom edge
+		// clip height if source extends beyond bottom edge
 		if srcStartY+srcHeight > inHeight {
 			effectiveHeight = inHeight - srcStartY
 		}
@@ -137,16 +136,16 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 			continue // Rectangle is completely off-screen (destination)
 		}
 
-		// Clip width if destination extends beyond right edge
+		// clip width if destination extends beyond right edge
 		if dstStartX+effectiveWidth > outWidth {
 			// Adjust source width based on destination clipping
 			excessWidth := dstStartX + effectiveWidth - outWidth
 			effectiveWidth -= excessWidth
 		}
 
-		// Clip height if destination extends beyond bottom edge
+		// clip height if destination extends beyond bottom edge
 		if dstStartY+effectiveHeight > outHeight {
-			// Adjust source height based on destination clipping
+
 			excessHeight := dstStartY + effectiveHeight - outHeight
 			effectiveHeight -= excessHeight
 		}
@@ -156,13 +155,13 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 			continue
 		}
 
-		// Skip this rectangle if it has 100% transparency or zero size
+		// skip this rectangle if it has 100% transparency or zero size
 		if effectiveWidth == 0 || effectiveHeight == 0 {
 			continue
 		}
 
-		// Use optimized SIMD blend function for the entire rectangle at once
-		// This function will choose the best implementation (SIMD vs fallback) based on platform support
+		// use optimized SIMD blend function for the entire rectangle at once
+		// this function will choose the best implementation (SIMD vs fallback) based on platform support
 		blendRectangle(
 			frame,
 			srcStartX, srcStartY,
@@ -175,36 +174,36 @@ func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth,
 }
 
 func main() {
-	fmt.Print("🔄 Compositing video... ")
+	fmt.Println("🔄 Compositing video... ")
 
-	// 1. Load the JSON rules
+	// 1. load the JSON rules
 	rulesFile, err := os.Open("input/rules.json")
 	if err != nil {
 		log.Fatalf("failed to open rules.json: %v", err)
 	}
 	defer rulesFile.Close()
 
-	// 2. Read the JSON rules
+	// 2. read the JSON rules
 	var rules RulesConfig
 	if err := json.NewDecoder(rulesFile).Decode(&rules); err != nil {
 		log.Fatalf("failed to parse rules.json: %v", err)
 	}
 
-	// 3. Open the raw input video
+	// 3. open the raw input video
 	inFile, err := os.Open("input/video.rvid")
 	if err != nil {
 		log.Fatalf("failed to open input video.rvid.gz: %v", err)
 	}
 	defer inFile.Close()
 
-	// 4. Read its header
+	// 4. read its header
 	var hdr Header
 	if err := binary.Read(inFile, binary.BigEndian, &hdr); err != nil {
 		log.Fatalf("failed to read header: %v", err)
 	}
-	fmt.Printf("📹 Input video: %dx%d, %d frames\n", hdr.Width, hdr.Height, hdr.FrameCount)
+	f("\n📹 Input video: %dx%d, %d frames\n", hdr.Width, hdr.Height, hdr.FrameCount)
 
-	// 5. Create the output file and write its header
+	// 5. create the output file and write its header
 	outFile, err := os.Create("output/video-out.raw")
 	if err != nil {
 		log.Fatalf("failed to create output file: %v", err)
@@ -223,57 +222,53 @@ func main() {
 		log.Fatalf("write frame count: %v", err)
 	}
 
-	// 6. Sort rectangles by Z-order
+	// 6. sort rectangles by Z-order
 	sort.Slice(rules.Rects, func(i, j int) bool {
 		return rules.Rects[i].Z < rules.Rects[j].Z
 	})
 
-	// 7. Use a single worker for better memory efficiency
-	// This gives the best efficiency score (FPS / memory usage)
+	// 7. use a single worker for better memory efficiency
+	// This gives the best efficiency score (FPS / memory usage) as tested on my local machine
 	numWorkers := 1 // 8. Set up worker pool
 	inFrameSize := int(hdr.Width * hdr.Height * 3)
 	outFrameSize := int(outWidth * outHeight * 3)
 
-	// Initialize an extremely small zero buffer to dramatically reduce memory usage
+	// initialize an extremely small zero buffer to dramatically reduce memory usage
 	// 4KB is enough for efficient clearing when processed in small chunks
-	zeroBufferSize := 4 * 1024 // 4KB buffer - extremely memory efficient
+	zeroBufferSize := 4 * 1024 // 4KB buffer
 	if outFrameSize < zeroBufferSize {
 		zeroBufferSize = outFrameSize
 	}
 	zeroBuffer = make([]byte, zeroBufferSize)
 
-	// Use minimal channel buffers to reduce memory usage
-	// Just enough capacity for single-worker mode
+	// use minimal channel buffers to reduce memory usage
+	// just enough capacity for single-worker mode
 	frameQueue := make(chan *Frame, 1)
 	resultQueue := make(chan *Frame, 1)
 
-	// Use a wait group to know when all workers are done
+	// use a wait group to know when all workers are done
 	var wg sync.WaitGroup
 
-	// Start worker goroutines
+	// start worker goroutines
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for frame := range frameQueue {
-				// Process the frame
 				processFrame(frame, &rules, hdr.Width, hdr.Height, outWidth, outHeight)
-
-				// Send to result queue for writing
 				resultQueue <- frame
 			}
 		}()
 	}
 
-	// Start a goroutine to close result queue when all workers are done
+	// start a goroutine to close result queue when all workers are done
 	go func() {
 		wg.Wait()
 		close(resultQueue)
 	}()
 
-	// Create a minimal frame set with exactly 2 preallocated frames
-	// This is the theoretical minimum for processing
-	// We never allocate more than these 2 frames, even if it means waiting
+	// create a minimal frame set with exactly 2 preallocated frames
+	// this is the theoretical minimum for processing (an assumption)
 	var initialFrames = [2]Frame{
 		{
 			inBuf:  make([]byte, inFrameSize),
@@ -288,55 +283,53 @@ func main() {
 	frameIndex := 0
 	framePool := sync.Pool{
 		New: func() interface{} {
-			// Only ever use preallocated frames to strictly control memory usage
+			// only ever use preallocated frames to strictly control memory usage
 			if frameIndex < len(initialFrames) {
 				frame := &initialFrames[frameIndex]
 				frameIndex++
 				return frame
 			}
-			// Strict memory control: reuse frame 0 instead of allocating new memory
-			// This may cause a brief serialization, but saves memory
+			// force strict memory control: reuse frame 0 instead of allocating new memory
+			// this may cause a brief serialization, but saves memory
 			return &initialFrames[0]
 		},
 	}
 
-	// Start a goroutine to read frames and enqueue them for processing
+	// start a goroutine to read frames and enqueue them for processing
 	go func() {
 		for frame := uint32(0); frame < hdr.FrameCount; frame++ {
-			// Get a frame from the pool
 			frameData := framePool.Get().(*Frame)
 			frameData.id = frame
 
-			// Read frame data
 			if _, err := io.ReadFull(inFile, frameData.inBuf); err != nil {
 				log.Fatalf("read frame %d: %v", frame, err)
 				close(frameQueue)
 				return
 			}
 
-			// Send to worker queue
+			// send to worker queue
 			frameQueue <- frameData
 		}
 		close(frameQueue)
 	}()
 
-	// Create a map to store frames that arrive out of order
+	// create a map to store frames that arrive out of order
 	pendingFrames := make(map[uint32]*Frame)
 	nextFrame := uint32(0)
 
-	// Process results and write to output in correct order
+	// process results and write to output in correct order
 	for frame := range resultQueue {
-		// If this is the next frame we're expecting, write it immediately
+		// if this is the next frame we're expecting, write it immediately
 		if frame.id == nextFrame {
 			if _, err := outFile.Write(frame.outBuf); err != nil {
 				log.Fatalf("write frame %d: %v", frame.id, err)
 			}
 			nextFrame++
 
-			// Return frame buffer to pool
+			// return frame buffer to pool
 			framePool.Put(frame)
 
-			// Check if we have any pending frames that can now be written
+			// check if we have any pending frames that can now be written
 			for {
 				if pendingFrame, exists := pendingFrames[nextFrame]; exists {
 					if _, err := outFile.Write(pendingFrame.outBuf); err != nil {
@@ -350,7 +343,7 @@ func main() {
 				}
 			}
 		} else {
-			// This frame arrived out of order, store it for later
+			// this frame arrived out of order, store it for later
 			pendingFrames[frame.id] = frame
 		}
 	}
