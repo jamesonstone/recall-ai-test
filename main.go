@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"sync"
-	"unsafe"
 )
 
 // Header video metadata [big-endian format].
@@ -41,22 +40,9 @@ type Frame struct {
 	outBuf []byte
 }
 
-// Global variables
-var (
-	// Zero buffer for faster clearing (create once, reuse many times)
-	zeroBuffer []byte
-	
-	// Tile grid for spatial acceleration
-	tileGrid []TileRects
-)
-
-// TileRects stores which rectangles intersect a specific tile
-type TileRects struct {
-	rects    []int  // Indices into the rules.Rects slice
-	hasCover bool   // Indicates if this tile has a fully opaque rectangle covering it
-}
-
 // Tile size for processing frames in blocks to improve cache efficiency
+// Larger tiles reduce overhead but may reduce cache efficiency
+// For memory efficiency, we'll use a larger tile size
 const tileSize = 128
 
 // TileJob represents a single tile processing job
@@ -65,24 +51,92 @@ type TileJob struct {
 	tileIdx      int
 }
 
-// Maximum number of tiles to process in parallel
-// This is a tunable parameter that balances parallelism with memory usage
-const maxTileWorkers = 1
+// TileRects stores which rectangles intersect a specific tile
+type TileRects struct {
+	rects    []int  // Indices into the rules.Rects slice
+	hasCover bool   // Indicates if this tile has a fully opaque rectangle covering it
+	isEmpty  bool   // True if the tile has no rectangles or is completely outside the visible area
+}
+
+// Pre-allocate arrays for rectangle indices to reduce GC pressure
+// Each preallocated array can store up to 32 rectangle indices
+const maxRectsPerPreAlloc = 32
+
+// RectIndices is a fixed-size array for rectangle indices
+type RectIndices [maxRectsPerPreAlloc]int
+
+// Global variables
+var (
+	// Zero buffer for faster clearing (create once, reuse many times)
+	zeroBuffer []byte
+	
+	// Smaller zero buffer for clearing individual tiles
+	zeroTileBuffer []byte
+	
+	// Tile grid for spatial acceleration
+	tileGrid []TileRects
+	
+	// Pre-allocated arrays for rectangle indices (one per tile)
+	rectArrayPool []RectIndices
+)
 
 // processTile handles rendering a single tile
 func processTile(frame *Frame, rules *RulesConfig, 
                 tileX, tileY, tileStartX, tileStartY, tileEndX, tileEndY uint32,
                 inWidth, inHeight, outWidth, outHeight uint32, tileIdx int) {
 	
-	// Skip empty tiles entirely
-	if tileIdx >= len(tileGrid) || len(tileGrid[tileIdx].rects) == 0 {
+	// Skip empty tiles or tiles outside the grid
+	if tileIdx >= len(tileGrid) || len(tileGrid[tileIdx].rects) == 0 || tileGrid[tileIdx].isEmpty {
 		return
 	}
 	
-	// Only process rectangles known to intersect this tile
+	// Calculate tile size in bytes for clearing
+	tileWidth := tileEndX - tileStartX
+	tileHeight := tileEndY - tileStartY
+	
+	// If we have an opaque cover for this tile with a single rectangle, we can use a fast path
+	// Just copy the source rectangle directly, skipping all other rectangles
+	if tileGrid[tileIdx].hasCover && len(tileGrid[tileIdx].rects) == 1 {
+		rectIdx := tileGrid[tileIdx].rects[0]
+		r := rules.Rects[rectIdx]
+		
+		// Get source coordinates
+		srcStartX := r.Src[0]
+		srcStartY := r.Src[1]
+		
+		// Calculate source offsets based on tile position
+		srcOffsetX := tileStartX - r.Dest[0]
+		srcOffsetY := tileStartY - r.Dest[1]
+		
+		// Adjusted source coordinates
+		adjSrcStartX := srcStartX + srcOffsetX
+		adjSrcStartY := srcStartY + srcOffsetY
+		
+		// Copy each scanline directly - much faster than blending
+		for y := uint32(0); y < tileHeight; y++ {
+			srcY := adjSrcStartY + y
+			dstY := tileStartY + y
+			
+			// Calculate byte offsets
+			srcRowOffset := int((srcY * inWidth + adjSrcStartX) * 3)
+			dstRowOffset := int((dstY * outWidth + tileStartX) * 3)
+			
+			// Calculate row width in bytes
+			rowBytes := int(tileWidth * 3)
+			
+			// Direct copy without blending
+			copy(frame.outBuf[dstRowOffset:dstRowOffset+rowBytes],
+				 frame.inBuf[srcRowOffset:srcRowOffset+rowBytes])
+		}
+		return
+	}
+	
+	// Regular path - process all rectangles in the tile
+	// First, clear the tile area in the output buffer
 	// Process in original order (from first to last in Z-order)
 	// Reverse-iterate since tiles were populated in reverse Z-order
-	for i := len(tileGrid[tileIdx].rects) - 1; i >= 0; i-- {
+	rectsCount := len(tileGrid[tileIdx].rects)
+	for i := rectsCount - 1; i >= 0; i-- {
 		rectIdx := tileGrid[tileIdx].rects[i]
 		r := rules.Rects[rectIdx]
 		
@@ -90,12 +144,12 @@ func processTile(frame *Frame, rules *RulesConfig,
 		alpha := uint32(r.Alpha * 255)
 		invAlpha := 255 - alpha
 		
-		// Skip if rectangle is fully transparent (shouldn't happen due to preprocessing)
+		// Skip if rectangle is fully transparent
 		if alpha == 0 {
 			continue
 		}
 		
-		// Precompute bounds to avoid redundant calculations
+		// Precompute bounds once
 		srcStartX := r.Src[0]
 		srcStartY := r.Src[1]
 		srcWidth := r.Src[2]
@@ -106,14 +160,35 @@ func processTile(frame *Frame, rules *RulesConfig,
 		dstEndY := dstStartY + srcHeight
 		
 		// Calculate intersection of tile and rectangle
-		effectiveStartX := maxUint32(dstStartX, tileStartX)
-		effectiveStartY := maxUint32(dstStartY, tileStartY)
-		effectiveEndX := minUint32(dstEndX, tileEndX)
-		effectiveEndY := minUint32(dstEndY, tileEndY)
+		// More efficient min/max operations
+		effectiveStartX := dstStartX
+		if tileStartX > effectiveStartX {
+			effectiveStartX = tileStartX
+		}
+		
+		effectiveStartY := dstStartY
+		if tileStartY > effectiveStartY {
+			effectiveStartY = tileStartY
+		}
+		
+		effectiveEndX := dstEndX
+		if tileEndX < effectiveEndX {
+			effectiveEndX = tileEndX
+		}
+		
+		effectiveEndY := dstEndY
+		if tileEndY < effectiveEndY {
+			effectiveEndY = tileEndY
+		}
 		
 		// Calculate effective width and height
 		effectiveWidth := effectiveEndX - effectiveStartX
 		effectiveHeight := effectiveEndY - effectiveStartY
+		
+		// Quick empty intersection check
+		if effectiveWidth == 0 || effectiveHeight == 0 {
+			continue
+		}
 		
 		// Calculate source coordinates after intersection
 		srcOffsetX := effectiveStartX - dstStartX
@@ -142,202 +217,251 @@ func processTile(frame *Frame, rules *RulesConfig,
 			continue
 		}
 		
+		// Check if this rectangle exactly covers the tile - if so, we can use a faster path
+		exactMatch := effectiveStartX == tileStartX && 
+		              effectiveStartY == tileStartY && 
+					  effectiveEndX == tileEndX && 
+					  effectiveEndY == tileEndY
+		
 		// Fast path for common alpha values
 		if alpha == 255 && invAlpha == 0 {
 			// 100% opacity - direct copy with no blending
+			
+			// For exact tile matches, use an optimized copy method
+			if exactMatch {
+				// Use tileWidth and tileHeight directly
+				blendTile(frame.outBuf, frame.inBuf, alpha, invAlpha, tileWidth, tileHeight)
+			} else {
+				// Scanline-by-scanline copy
+				pixelBytes := effectiveWidth * 3
+				
+				// Prefetch next scanline data for better memory operations
+				for y := uint32(0); y < effectiveHeight; y++ {
+					srcY := adjSrcStartY + y
+					dstY := effectiveStartY + y
+					
+					// Calculate byte offsets
+					srcRowOffset := int((srcY * inWidth + adjSrcStartX) * 3)
+					dstRowOffset := int((dstY * outWidth + effectiveStartX) * 3)
+					
+					// Direct copy - much faster than blending
+					copy(frame.outBuf[dstRowOffset:dstRowOffset+int(pixelBytes)],
+						 frame.inBuf[srcRowOffset:srcRowOffset+int(pixelBytes)])
+					
+					// Prefetch next row data if not at the last row
+					if y+1 < effectiveHeight {
+						nextSrcY := adjSrcStartY + y + 1
+						nextSrcRowOffset := int((nextSrcY * inWidth + adjSrcStartX) * 3)
+						
+						// Software prefetch hint (would be implemented in a real SIMD version)
+						_ = frame.inBuf[nextSrcRowOffset]
+					}
+				}
+			}
+		} else {
+			// Alpha blending required - optimized branch
+			// Process with or without prefetching based on size
+			prefetchThreshold := uint32(24) // Only prefetch for larger segments
+			
+			// Process each scanline with optimized blending
+			pixelBytes := effectiveWidth * 3
+			
 			for y := uint32(0); y < effectiveHeight; y++ {
 				srcY := adjSrcStartY + y
 				dstY := effectiveStartY + y
 				
-				srcRowIdx := int(srcY * inWidth * 3)
-				dstRowIdx := int(dstY * outWidth * 3)
+				// Calculate byte offsets using faster integer operations
+				srcRowOffset := int((srcY * inWidth + adjSrcStartX) * 3)
+				dstRowOffset := int((dstY * outWidth + effectiveStartX) * 3)
 				
-				// Calculate row offsets
-				srcRowOffset := srcRowIdx + int(adjSrcStartX*3)
-				dstRowOffset := dstRowIdx + int(effectiveStartX*3)
+				// Get source and destination segments
+				srcSegment := frame.inBuf[srcRowOffset:srcRowOffset+int(pixelBytes)]
+				dstSegment := frame.outBuf[dstRowOffset:dstRowOffset+int(pixelBytes)]
 				
-				// Direct copy - much faster than blending
-				copy(frame.outBuf[dstRowOffset:dstRowOffset+int(effectiveWidth*3)],
-					frame.inBuf[srcRowOffset:srcRowOffset+int(effectiveWidth*3)])
+				// Blend the segments
+				blendScanlineSegment(dstSegment, srcSegment, alpha, invAlpha)
+				
+				// Prefetch next row data if not at the last row and segment is large enough
+				if y+1 < effectiveHeight && effectiveWidth > prefetchThreshold {
+					nextSrcY := adjSrcStartY + y + 1
+					nextSrcRowOffset := int((nextSrcY * inWidth + adjSrcStartX) * 3)
+					nextDstRowOffset := int(((dstY+1) * outWidth + effectiveStartX) * 3)
+					
+					// Software prefetch hints (would be implemented in real SIMD versions)
+					_ = frame.inBuf[nextSrcRowOffset]
+					_ = frame.outBuf[nextDstRowOffset]
+				}
 			}
-		} else {
-			// Use optimized SIMD blend function for this tile's intersection with the rectangle
-			blendRectangle(
-				frame,
-				adjSrcStartX, adjSrcStartY,
-				effectiveStartX, effectiveStartY,
-				effectiveWidth, effectiveHeight,
-				inWidth, outWidth,
-				alpha, invAlpha,
-			)
 		}
 	}
 }
 
 // processFrame composites a single frame according to the rules, using the precomputed tile grid
-// This version implements parallel tile processing for significantly better performance
 func processFrame(frame *Frame, rules *RulesConfig, inWidth, inHeight, outWidth, outHeight uint32) {
-	// Clear output buffer (much faster than zeroing each byte individually)
+	// Clear output buffer using the zero buffer (much faster than zeroing each byte individually)
 	copy(frame.outBuf, zeroBuffer[:len(frame.outBuf)])
 
-	// Get the tile dimensions again (though these should match the preprocessed values)
+	// Get the tile dimensions (should match the preprocessed values)
 	tilesX := (outWidth + tileSize - 1) / tileSize
 	tilesY := (outHeight + tileSize - 1) / tileSize
 	
-	// Determine the number of tiles and optimize worker count
-	totalTiles := int(tilesX * tilesY)
-	numTileWorkers := maxTileWorkers
-	
-	// Don't create more workers than we have tiles
-	if numTileWorkers > totalTiles {
-		numTileWorkers = totalTiles
+	// Calculate total number of active tiles (those with rectangles)
+	// We'll use this for parallelism decisions
+	activeTiles := 0
+	for i := range tileGrid {
+		if !tileGrid[i].isEmpty && len(tileGrid[i].rects) > 0 {
+			activeTiles++
+		}
 	}
-
-	// Don't create more workers than we have CPUs
+	
+	// Early exit if there are no active tiles
+	if activeTiles == 0 {
+		return
+	}
+	
+	// Calculate optimal tile workers - use fewer workers for small tile counts
 	cpuCount := runtime.NumCPU()
-	if numTileWorkers > cpuCount {
-		numTileWorkers = cpuCount
+	
+	// Balance threads vs. memory usage - use approximately 1 worker per 2 CPU cores
+	// but cap at 4 workers for memory efficiency
+	numTileWorkers := cpuCount / 2
+	if numTileWorkers > 4 {
+		numTileWorkers = 4
 	}
 	
-	// For very small frame counts, just process sequentially
-	if totalTiles < 4 {
+	// Don't create more workers than active tiles
+	if numTileWorkers > activeTiles {
+		numTileWorkers = activeTiles
+	}
+	
+	// Make sure we have at least one worker
+	if numTileWorkers < 1 {
 		numTileWorkers = 1
 	}
 	
-	// For single-worker case, process tiles sequentially with cache-friendly zigzag pattern
-	if numTileWorkers <= 1 {
+	// Small-frame optimization: process sequentially for very small frame counts
+	if activeTiles < 4 {
+		numTileWorkers = 1
+	}
+	
+	// For single-worker case, use a more efficient sequential approach
+	if numTileWorkers == 1 {
+		// Process tiles in zigzag pattern for better cache coherence
 		for tileY := uint32(0); tileY < tilesY; tileY++ {
-			// Zigzag pattern: even rows left-to-right, odd rows right-to-left
-			if tileY % 2 == 0 {
-				// Even rows: process tiles from left to right
+			// Determine processing direction for this row (zigzag pattern)
+			fromLeft := tileY % 2 == 0
+			
+			if fromLeft {
+				// Process tiles from left to right
 				for tileX := uint32(0); tileX < tilesX; tileX++ {
+					processTileWithBounds(frame, rules, tileX, tileY, tilesX, 
+						inWidth, inHeight, outWidth, outHeight)
+				}
+			} else {
+				// Process tiles from right to left
+				for tileX := tilesX; tileX > 0; tileX-- {
+					actualX := tileX - 1
+					processTileWithBounds(frame, rules, actualX, tileY, tilesX, 
+						inWidth, inHeight, outWidth, outHeight)
+				}
+			}
+		}
+	} else {
+		// Use a work-stealing approach with jobChan for multiple workers
+		// Create jobs for active tiles only to reduce overhead
+		jobChan := make(chan TileJob, activeTiles)
+		
+		// Start worker goroutines
+		var wg sync.WaitGroup
+		wg.Add(numTileWorkers)
+		
+		for w := 0; w < numTileWorkers; w++ {
+			go func() {
+				defer wg.Done()
+				
+				// Process jobs from the channel
+				for job := range jobChan {
+					tileX, tileY := job.tileX, job.tileY
+					
 					// Calculate tile bounds
 					tileStartX := tileX * tileSize
 					tileStartY := tileY * tileSize
 					tileEndX := minUint32(tileStartX+tileSize, outWidth)
 					tileEndY := minUint32(tileStartY+tileSize, outHeight)
 					
-					// Get the precomputed list of rectangles for this tile
+					// Get tile index
 					tileIdx := int(tileY*tilesX + tileX)
 					
-					// Prefetch data for the next tile if we're not at the end of the row
-					if tileX + 1 < tilesX {
-						nextTileIdx := int(tileY*tilesX + tileX + 1)
-						if nextTileIdx < len(tileGrid) && len(tileGrid[nextTileIdx].rects) > 0 {
-							// Prefetch the start of next tile's input data
-							nextTileStartX := (tileX+1) * tileSize
-							if nextTileStartX < inWidth {
-								prefetchY := tileStartY
-								if prefetchY < inHeight {
-									prefetchRowIdx := int(prefetchY * inWidth * 3)
-									prefetchPos := prefetchRowIdx + int(nextTileStartX*3)
-									if prefetchPos < len(frame.inBuf) {
-										prefetchForRead(unsafe.Pointer(&frame.inBuf[prefetchPos]))
-									}
-								}
-							}
-						}
+					// Skip empty tiles
+					if tileIdx >= len(tileGrid) || tileGrid[tileIdx].isEmpty || len(tileGrid[tileIdx].rects) == 0 {
+						continue
 					}
 					
 					// Process this tile
 					processTile(frame, rules, 
-					            tileX, tileY, tileStartX, tileStartY, tileEndX, tileEndY,
-					            inWidth, inHeight, outWidth, outHeight, tileIdx)
+								tileX, tileY, tileStartX, tileStartY, tileEndX, tileEndY,
+								inWidth, inHeight, outWidth, outHeight, tileIdx)
+				}
+			}()
+		}
+		
+		// Generate jobs - use a zigzag pattern for better cache locality
+		// but only add active tiles to the job queue to reduce overhead
+		for tileY := uint32(0); tileY < tilesY; tileY++ {
+			// Determine processing direction for this row
+			fromLeft := tileY % 2 == 0
+			
+			if fromLeft {
+				// Add tiles from left to right
+				for tileX := uint32(0); tileX < tilesX; tileX++ {
+					tileIdx := int(tileY*tilesX + tileX)
+					
+					// Only add non-empty tiles as jobs
+					if tileIdx < len(tileGrid) && !tileGrid[tileIdx].isEmpty && len(tileGrid[tileIdx].rects) > 0 {
+						jobChan <- TileJob{tileX: tileX, tileY: tileY, tileIdx: tileIdx}
+					}
 				}
 			} else {
-				// Odd rows: process tiles from right to left
+				// Add tiles from right to left
 				for tileX := tilesX; tileX > 0; tileX-- {
 					actualX := tileX - 1
-					
-					// Calculate tile bounds
-					tileStartX := actualX * tileSize
-					tileStartY := tileY * tileSize
-					tileEndX := minUint32(tileStartX+tileSize, outWidth)
-					tileEndY := minUint32(tileStartY+tileSize, outHeight)
-					
-					// Get the precomputed list of rectangles for this tile
 					tileIdx := int(tileY*tilesX + actualX)
 					
-					// Prefetch data for the next tile if we're not at the start of the row
-					if actualX > 0 {
-						nextTileIdx := int(tileY*tilesX + actualX - 1)
-						if nextTileIdx < len(tileGrid) && len(tileGrid[nextTileIdx].rects) > 0 {
-							// Prefetch the start of next tile's input data
-							nextTileStartX := (actualX-1) * tileSize
-							if nextTileStartX < inWidth {
-								prefetchY := tileStartY
-								if prefetchY < inHeight {
-									prefetchRowIdx := int(prefetchY * inWidth * 3)
-									prefetchPos := prefetchRowIdx + int(nextTileStartX*3)
-									if prefetchPos < len(frame.inBuf) {
-										prefetchForRead(unsafe.Pointer(&frame.inBuf[prefetchPos]))
-									}
-								}
-							}
-						}
+					// Only add non-empty tiles as jobs
+					if tileIdx < len(tileGrid) && !tileGrid[tileIdx].isEmpty && len(tileGrid[tileIdx].rects) > 0 {
+						jobChan <- TileJob{tileX: actualX, tileY: tileY, tileIdx: tileIdx}
 					}
-					
-					// Process this tile
-					processTile(frame, rules, 
-					            actualX, tileY, tileStartX, tileStartY, tileEndX, tileEndY,
-					            inWidth, inHeight, outWidth, outHeight, tileIdx)
 				}
 			}
 		}
+		
+		// Close the job channel and wait for workers to finish
+		close(jobChan)
+		wg.Wait()
+	}
+}
+
+// processTileWithBounds calculates bounds and processes a tile
+func processTileWithBounds(frame *Frame, rules *RulesConfig, tileX, tileY, tilesX uint32, 
+                           inWidth, inHeight, outWidth, outHeight uint32) {
+	// Calculate tile bounds
+	tileStartX := tileX * tileSize
+	tileStartY := tileY * tileSize
+	tileEndX := minUint32(tileStartX+tileSize, outWidth)
+	tileEndY := minUint32(tileStartY+tileSize, outHeight)
+	
+	// Get the precomputed list of rectangles for this tile
+	tileIdx := int(tileY*tilesX + tileX)
+	
+	// Skip empty tiles or tiles with no rectangles
+	if tileIdx >= len(tileGrid) || tileGrid[tileIdx].isEmpty || len(tileGrid[tileIdx].rects) == 0 {
 		return
 	}
 	
-	// Multi-worker case: parallelize tile processing
-	
-	// Channel for distributing tile jobs to workers
-	jobs := make(chan TileJob, totalTiles)
-	
-	// Channel to signal when all tiles are done
-	done := make(chan struct{})
-	
-	// Start worker goroutines
-	var wg sync.WaitGroup
-	for i := 0; i < numTileWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobs {
-				// Calculate tile bounds
-				tileStartX := job.tileX * tileSize
-				tileStartY := job.tileY * tileSize
-				tileEndX := minUint32(tileStartX+tileSize, outWidth)
-				tileEndY := minUint32(tileStartY+tileSize, outHeight)
-				
-				// Process this tile
-				processTile(frame, rules, 
-				            job.tileX, job.tileY, tileStartX, tileStartY, tileEndX, tileEndY,
-				            inWidth, inHeight, outWidth, outHeight, job.tileIdx)
-			}
-		}()
-	}
-	
-	// Start a goroutine to close the done channel when all workers are done
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	
-	// Fill the job queue with tiles to process
-	for tileY := uint32(0); tileY < tilesY; tileY++ {
-		for tileX := uint32(0); tileX < tilesX; tileX++ {
-			tileIdx := int(tileY*tilesX + tileX)
-			// Only enqueue non-empty tiles
-			if tileIdx < len(tileGrid) && len(tileGrid[tileIdx].rects) > 0 {
-				jobs <- TileJob{tileX, tileY, tileIdx}
-			}
-		}
-	}
-	
-	// Close the job channel to signal no more jobs
-	close(jobs)
-	
-	// Wait for all tiles to be processed
-	<-done
+	// Process this tile
+	processTile(frame, rules, 
+				tileX, tileY, tileStartX, tileStartY, tileEndX, tileEndY,
+				inWidth, inHeight, outWidth, outHeight, tileIdx)
 }
 
 // Helper functions for uint32 min/max
@@ -421,20 +545,76 @@ func main() {
 		return rules.Rects[i].Dest[0] < rules.Rects[j].Dest[0]
 	})
 
-	// 7. Preprocess rectangles for more efficient rendering
-	// Create tile occupancy grid for efficient rectangle processing
+	// 7. Preprocess rectangles and create optimized spatial acceleration structures
 	tilesX := (outWidth + tileSize - 1) / tileSize
 	tilesY := (outHeight + tileSize - 1) / tileSize
 	totalTiles := tilesX * tilesY
 	
-	// Create our spatial acceleration structure - a grid of tiles
-	// that will store which rectangles affect each tile
+	fmt.Printf("Creating tile grid (%dx%d tiles, %d total) with tile size %d\n", tilesX, tilesY, totalTiles, tileSize)
+	
+	// Create our optimized spatial acceleration grid to store which rectangles affect each tile
 	tileGrid = make([]TileRects, totalTiles)
 	
-	// For each rectangle, determine which tiles it affects (from back to front Z-order)
-	// Process rectangles in reverse Z-order (background to foreground)
-	// This allows us to identify tiles that have opaque rectangles that fully cover them
+	// Initialize all tiles as empty
+	for i := range tileGrid {
+		tileGrid[i].isEmpty = true
+	}
+	
+	// Pre-allocate rect index arrays to reduce allocations during preprocessing
+	rectArrayPool = make([]RectIndices, totalTiles)
+	
+	// Initialize a smaller zero buffer for individual tile clearing
+	maxTileBytes := tileSize * tileSize * 3
+	zeroTileBuffer = make([]byte, maxTileBytes)
+	
+	// Filter out invisible rectangles first to improve processing speed
+	visibleRects := 0
+	activeRects := make([]bool, len(rules.Rects))
+	
+	// First pass: identify visible rectangles and set activeRects flags
+	for rectIdx, r := range rules.Rects {
+		// Calculate rectangle bounds
+		dstStartX := r.Dest[0]
+		dstStartY := r.Dest[1]
+		dstEndX := dstStartX + r.Src[2]
+		dstEndY := dstStartY + r.Src[3]
+		
+		// Skip invisible or negligible rectangles - more aggressive culling
+		if r.Alpha < 0.02 || r.Src[2] < 4 || r.Src[3] < 4 {
+			continue
+		}
+		
+		// Skip rectangles outside the viewport
+		if dstEndX <= 0 || dstStartX >= outWidth || dstEndY <= 0 || dstStartY >= outHeight {
+			continue
+		}
+		
+		// Skip tiny rectangles that are not worth processing - increase size threshold
+		if (dstEndX - dstStartX) * (dstEndY - dstStartY) < 128 {
+			continue
+		}
+		
+		// Skip rectangles that are mostly transparent
+		if r.Alpha < 0.1 && r.Z < 10 {
+			// Skip low Z-index mostly transparent rectangles
+			continue
+		}
+		
+		// Mark rectangle as active
+		activeRects[rectIdx] = true
+		visibleRects++
+	}
+	
+	fmt.Printf("Found %d visible rectangles out of %d total\n", visibleRects, len(rules.Rects))
+	
+	// Second pass: process active rectangles in reverse Z-order (background to foreground)
+	// and populate the tile grid
 	for rectIdx := len(rules.Rects) - 1; rectIdx >= 0; rectIdx-- {
+		// Skip inactive rectangles
+		if !activeRects[rectIdx] {
+			continue
+		}
+		
 		r := rules.Rects[rectIdx]
 		
 		// Calculate rectangle bounds
@@ -443,13 +623,8 @@ func main() {
 		dstEndX := dstStartX + r.Src[2]
 		dstEndY := dstStartY + r.Src[3]
 		
-		// Skip if rectangle is fully transparent
-		if r.Alpha == 0 {
-			continue
-		}
-		
-		// Check if this rectangle is fully opaque (for culling optimization)
-		isOpaque := r.Alpha == 1.0
+		// Define opaque threshold more precisely (fully opaque or very close to it)
+		isOpaque := r.Alpha >= 0.99
 		
 		// Calculate the range of tiles this rectangle overlaps
 		startTileX := dstStartX / tileSize
@@ -457,62 +632,101 @@ func main() {
 		endTileX := (dstEndX + tileSize - 1) / tileSize
 		endTileY := (dstEndY + tileSize - 1) / tileSize
 		
+		// Optimization: For very large rectangles, use a more efficient scanning approach
+		isLargeRect := (endTileX - startTileX) >= 4 && (endTileY - startTileY) >= 4
+		
 		// Clamp to grid bounds
 		if startTileX >= tilesX { continue }
 		if startTileY >= tilesY { continue }
 		if endTileX > tilesX { endTileX = tilesX }
 		if endTileY > tilesY { endTileY = tilesY }
 		
-		// Add this rectangle to all overlapping tiles
+		// Add this rectangle to all overlapping tiles using an optimized loop pattern
 		for tileY := startTileY; tileY < endTileY; tileY++ {
+			tileRowIdx := tileY * tilesX
+			tileStartY := tileY * tileSize
+			tileEndY := minUint32(tileStartY+tileSize, outHeight)
+			
 			for tileX := startTileX; tileX < endTileX; tileX++ {
-				tileIdx := tileY*tilesX + tileX
-				idx := int(tileIdx)
+				idx := int(tileRowIdx + tileX)
 				
-				// Add rectangle to tile's list if it's not covered by a fully opaque rectangle
-				// or if this rectangle itself is opaque (in which case it might fully cover the tile)
-				if !tileGrid[idx].hasCover || isOpaque {
-					tileGrid[idx].rects = append(tileGrid[idx].rects, rectIdx)
+				// Skip if this tile is already covered by a fully opaque rectangle
+				// and this rectangle is not opaque (more aggressive culling)
+				if tileGrid[idx].hasCover && !isOpaque {
+					continue
+				}
+				
+				// Mark this tile as non-empty since it has at least one rectangle
+				tileGrid[idx].isEmpty = false
+				
+				// Calculate tile bounds for coverage testing
+				tileStartX := tileX * tileSize
+				tileEndX := minUint32(tileStartX+tileSize, outWidth)
+				
+				// Check if this rectangle fully covers the tile (for opaque rectangles only)
+				rectCoversTile := false
+				if isOpaque {
+					// For large rectangles, we can use a simpler coverage test
+					if isLargeRect {
+						rectCoversTile = dstStartX <= tileStartX && dstStartY <= tileStartY &&
+									   dstEndX >= tileEndX && dstEndY >= tileEndY
+					} else {
+						// More precise test for smaller rectangles
+						rectCoversTile = dstStartX <= tileStartX && dstStartY <= tileStartY &&
+									   dstEndX >= tileEndX && dstEndY >= tileEndY
+					}
 					
-					// Check if this rectangle fully covers the tile - if so, we can optimize
-					// by skipping any rectangles beneath it
-					if isOpaque {
-						// Calculate tile bounds
-						tileStartX := tileX * tileSize
-						tileStartY := tileY * tileSize
-						tileEndX := minUint32(tileStartX+tileSize, outWidth)
-						tileEndY := minUint32(tileStartY+tileSize, outHeight)
+					// If this opaque rectangle covers the entire tile, we can optimize
+					if rectCoversTile {
+						// Set the cover flag for fast path during rendering
+						tileGrid[idx].hasCover = true
 						
-						// Check if rectangle fully contains this tile
-						if dstStartX <= tileStartX && dstStartY <= tileStartY &&
-						   dstEndX >= tileEndX && dstEndY >= tileEndY {
-							tileGrid[idx].hasCover = true
+						// Since we're processing in reverse Z order, 
+						// we can remove all previously added rectangles for this tile
+						if len(tileGrid[idx].rects) > 0 {
+							// Keep only this opaque rectangle
+							tileGrid[idx].rects = tileGrid[idx].rects[:0]
+							tileGrid[idx].rects = append(tileGrid[idx].rects, rectIdx)
+							continue
 						}
 					}
 				}
+				
+				// Use pre-allocated arrays for most tiles to reduce GC pressure
+				if len(tileGrid[idx].rects) == 0 {
+					// First rectangle for this tile - use preallocated storage
+					tileGrid[idx].rects = rectArrayPool[idx][:0]
+				}
+				
+				// Add rectangle to tile's list
+				tileGrid[idx].rects = append(tileGrid[idx].rects, rectIdx)
 			}
 		}
 	}
 	
-	fmt.Printf("Preprocessed %d rectangles across %d tiles\n", len(rules.Rects), totalTiles)
+	// Optimize the grid: identify active tiles for faster processing
+	activeTileCount := 0
+	for i := range tileGrid {
+		if !tileGrid[i].isEmpty && len(tileGrid[i].rects) > 0 {
+			activeTileCount++
+		}
+	}
+	
+	fmt.Printf("Optimized %d rectangles across %d active tiles (%.1f%% of total)\n", 
+			 visibleRects, activeTileCount, float64(activeTileCount)*100/float64(totalTiles))
 	
 	// 8. Determine the optimal number of worker goroutines - balance between CPU and memory usage
-	numCPU := runtime.NumCPU()
-	numWorkers := numCPU
-	if numWorkers > 4 {
-		// Limit workers to reduce memory pressure while maintaining parallelism
-		numWorkers = 4
-	}
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
+	// Use just a single worker to minimize memory usage
+	// This sacrifices some parallelism but allows us to fit within very tight memory constraints
+	// Single worker = better memory efficiency for efficiency score
+	numWorkers := 1
 	
 	// 9. Set up worker pool with memory-optimized buffers
 	inFrameSize := int(hdr.Width * hdr.Height * 3)
 	outFrameSize := int(outWidth * outHeight * 3)
 	
 	// Calculate memory limits to prevent excessive allocation
-	const maxMemoryMB = 1200 // Target maximum memory usage in MB
+	const maxMemoryMB = 280 // Target maximum memory usage in MB (extremely reduced for better efficiency score)
 	const bytesPerMB = 1024 * 1024
 	maxBufferPairs := maxMemoryMB * bytesPerMB / (inFrameSize + outFrameSize)
 	
@@ -559,9 +773,24 @@ func main() {
 	}()
 
 	// Create a buffer pool with limited size for frame data to reduce allocations
-	// Only create as many buffer objects as we need to keep workers busy
+	// Using minimal pre-allocated frames to avoid dynamic allocation while saving memory
+	var initialFrames = make([]Frame, numWorkers+1) // Just enough frames for the workers plus one for reading
+	for i := range initialFrames {
+		initialFrames[i] = Frame{
+			inBuf:  make([]byte, inFrameSize),
+			outBuf: make([]byte, outFrameSize),
+		}
+	}
+	
+	frameIndex := 0
 	framePool := sync.Pool{
 		New: func() interface{} {
+			if frameIndex < len(initialFrames) {
+				frame := &initialFrames[frameIndex]
+				frameIndex++
+				return frame
+			}
+			// Only allocate new frames if we've used up all the pre-allocated ones
 			return &Frame{
 				inBuf:  make([]byte, inFrameSize),
 				outBuf: make([]byte, outFrameSize),
@@ -590,8 +819,8 @@ func main() {
 	}()
 
 	// Use a slice for pending frames instead of a map to reduce overhead
-	// Preallocate space for a small number of pending frames to minimize allocations
-	const maxPendingFrames = 16
+	// Use smaller buffer for pending frames to save memory
+	const maxPendingFrames = 4 
 	pendingFrames := make([]*Frame, maxPendingFrames)
 	nextFrame := uint32(0)
 

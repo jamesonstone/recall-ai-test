@@ -2,3 +2,5 @@ input/video.rvid*
 output/*
 test/*.rvid.gz
 bin/*
+recall-ai-test
+video-compositor
